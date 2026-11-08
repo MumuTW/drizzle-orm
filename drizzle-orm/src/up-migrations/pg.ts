@@ -1,7 +1,6 @@
 import type { BatchItem } from '~/batch.ts';
 import type { MigrationMeta } from '~/migrator.ts';
 import type { PgAsyncDatabase } from '~/pg-core/async/db.ts';
-import type { PgAsyncTransaction } from '~/pg-core/async/session.ts';
 import type { PgQueryResultHKT } from '~/pg-core/session.ts';
 import { type SQL, sql } from '~/sql/sql.ts';
 import { assertUnreachable } from '~/utils.ts';
@@ -9,77 +8,68 @@ import { GET_VERSION_FOR, type UpgradeResult } from './utils.ts';
 
 /**
  * Upgrade from version 0 to version 1:
- * 1. Read all existing DB migrations
- * 2. Sort localMigrations ASC by millis and if the same - sort by name
- * 3. Match each DB row to a local migration
- * If multiple migrations share the same second, use hash matching as a tiebreaker
- * Not implemented for now -> If hash matching fails, fall back to serial id ordering
- * 5. Create extra column and backfill names for matched migrations
+ * Validate a complete, unambiguous, one-to-one mapping of historical SQL before
+ * backfilling names. Folder timestamps can change during conversion and are not
+ * evidence of identity. Identical SQL in multiple local migrations is ambiguous.
  */
 const upToV1 = async (
 	migrationsSchema: string,
 	migrationsTable: string,
 	db: PgAsyncDatabase<PgQueryResultHKT, any>,
 	localMigrations: MigrationMeta[],
-	mode: 'transaction' | 'batch' | 'execute',
+	mode: 'batch' | 'execute',
 ): Promise<void> => {
 	const table = sql`${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)}`;
 
 	// 1. Read all existing DB migrations
 	// Sort them by ids asc (order how they were applied)
-	const dbRows = await db.session.objects<{ id: number; hash: string; created_at: string }>(
-		sql`SELECT id, hash, created_at FROM ${table} ORDER BY id ASC`,
+	const dbRows = await db.session.objects<{ id: number; hash: string }>(
+		sql`SELECT id, hash FROM ${table} ORDER BY id ASC`,
 	);
 
-	// 2. Sort ASC by millis and if the same - sort by name
-	localMigrations.sort((a, b) =>
-		a.folderMillis !== b.folderMillis ? a.folderMillis - b.folderMillis : (a.name ?? '').localeCompare(b.name ?? '')
-	);
-
-	const byMillis = new Map<number, MigrationMeta[]>();
-	const byHash = new Map<string, MigrationMeta>();
+	// Keep all candidates: a hash checks content, but is not a unique migration ID.
+	const byHash = new Map<string, MigrationMeta[]>();
 	for (const lm of localMigrations) {
-		if (!byMillis.has(lm.folderMillis)) {
-			byMillis.set(lm.folderMillis, []);
-		}
-		byMillis.get(lm.folderMillis)!.push(lm);
-		byHash.set(lm.hash, lm);
+		const candidates = byHash.get(lm.hash) ?? [];
+		candidates.push(lm);
+		byHash.set(lm.hash, candidates);
 	}
 
-	// 	3. Match each DB row to a local migration
-	// 	Priority: millis -> hash
 	const toApply: { id: number; name: string }[] = [];
-	let unmatchedIds: number[] = [];
+	const matchedNames = new Map<string, number>();
+	const problems: string[] = [];
 
 	for (const dbRow of dbRows) {
-		const stringified = String(dbRow.created_at);
-		const millis = Number(stringified.substring(0, stringified.length - 3) + '000');
-		const candidates = byMillis.get(millis);
-
-		let matched: MigrationMeta | undefined;
-
-		if (candidates && candidates.length === 1) {
-			matched = candidates[0];
-		} else if (candidates && candidates.length > 1) {
-			matched = candidates.find((c) => c.hash === dbRow.hash);
-		} else {
-			matched = byHash.get(dbRow.hash);
+		const candidates = byHash.get(dbRow.hash);
+		if (!candidates?.length) {
+			problems.push(`id ${dbRow.id}: no local migration has the stored SQL hash`);
+			continue;
+		}
+		if (candidates.length !== 1) {
+			problems.push(
+				`id ${dbRow.id}: multiple local migrations have the stored SQL hash (${
+					candidates.map((c) => c.name).join(', ')
+				})`,
+			);
+			continue;
 		}
 
-		if (matched) toApply.push({ id: dbRow.id, name: matched.name });
-		else unmatchedIds.push(dbRow.id);
+		const matched = candidates[0]!;
+		const previousId = matchedNames.get(matched.name);
+		if (previousId !== undefined) {
+			problems.push(`ids ${previousId}, ${dbRow.id}: both match local migration ${matched.name}`);
+			continue;
+		}
+		matchedNames.set(matched.name, dbRow.id);
+		toApply.push({ id: dbRow.id, name: matched.name });
 	}
 
-	// 4. Check for unmatched
-	// Our assumption on this migration flow is that all DB entries should be matched to a local migration
-	// (if same seconds - fallback to hash, if hash fails - corner case)
-	// If there are unmatched entries, it means that the local environment is missing migrations that have been applied to the DB,
-	// which can lead to inconsistencies and potential issues when running future migrations
-	if (unmatchedIds.length > 0) {
+	// A partial plan must never change the ledger or make old SQL look pending.
+	if (problems.length > 0) {
 		throw Error(
-			`While upgrading your database migrations table we found ${unmatchedIds.length} migrations (ids: ${
-				unmatchedIds.join(', ')
-			}) in the database that do not match any local migration. This means that some migrations were applied to the database but are missing from the local environment`,
+			`Cannot safely upgrade your database migrations table: ${
+				problems.join('; ')
+			}. Resolve the missing, modified or ambiguous migration history before retrying. No migration names have been written.`,
 		);
 	}
 
@@ -100,14 +90,8 @@ const upToV1 = async (
 
 	// batch - neon http
 	// execute - xata http
-	// transaction -> other
-	if (mode === 'transaction') {
-		await db.transaction(async (tx: PgAsyncTransaction<any, any>) => {
-			for (const sql of sqls) {
-				await tx.execute(sql);
-			}
-		});
-	} else if (mode === 'batch') {
+	// Transactional callers already hold the ledger lock in the enclosing transaction.
+	if (mode === 'batch') {
 		const database = db as PgAsyncDatabase<PgQueryResultHKT, any> & {
 			batch(batch: [BatchItem<'pg'>, ...BatchItem<'pg'>[]]): Promise<unknown>;
 		};
@@ -174,7 +158,19 @@ export async function upgradeIfNeeded(
 
 	const version = GET_VERSION_FOR.pg(rows.map((r) => r.column_name));
 
-	if (version < 1) await upToV1(migrationsSchema, migrationsTable, db, localMigrations, mode);
+	if (version < 1) {
+		if (mode === 'transaction') {
+			await db.transaction(async (tx) => {
+				// Keep the historical rows stable between validation and backfill. A second
+				// upgrader must recheck the version after acquiring the lock, not remap v1.
+				const table = sql`${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)}`;
+				await tx.execute(sql`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+				await upgradeIfNeeded(migrationsSchema, migrationsTable, tx, localMigrations, 'execute');
+			});
+		} else {
+			await upToV1(migrationsSchema, migrationsTable, db, localMigrations, mode);
+		}
+	}
 
 	return { newDb: false };
 }
