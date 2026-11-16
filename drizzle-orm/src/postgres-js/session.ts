@@ -14,11 +14,13 @@ import { fillPlaceholders, type Query } from '~/sql/sql.ts';
 import { tracer } from '~/tracing.ts';
 import { type Assume, mapResultRow } from '~/utils.ts';
 
+type QueryClient = Pick<Sql, 'unsafe'>;
+
 export class PostgresJsPreparedQuery<T extends PreparedQueryConfig> extends PgPreparedQuery<T> {
 	static override readonly [entityKind]: string = 'PostgresJsPreparedQuery';
 
 	constructor(
-		private client: Sql,
+		private client: QueryClient,
 		private queryString: string,
 		private params: unknown[],
 		private logger: Logger,
@@ -112,7 +114,7 @@ export interface PostgresJsSessionOptions {
 }
 
 export class PostgresJsSession<
-	TSQL extends Sql,
+	TSQL extends QueryClient & Partial<Pick<Sql, 'begin'>>,
 	TFullSchema extends Record<string, unknown>,
 	TSchema extends TablesRelationalConfig,
 > extends PgSession<PostgresJsQueryResultHKT, TFullSchema, TSchema> {
@@ -176,6 +178,12 @@ export class PostgresJsSession<
 		transaction: (tx: PostgresJsTransaction<TFullSchema, TSchema>) => Promise<T>,
 		config?: PgTransactionConfig,
 	): Promise<T> {
+		if (typeof this.client.begin !== 'function') {
+			return Promise.reject(
+				new Error('Manage transactions directly when using a reserved Postgres.js connection.'),
+			);
+		}
+
 		return this.client.begin(async (client) => {
 			const session = new PostgresJsSession<TransactionSql, TFullSchema, TSchema>(
 				client,

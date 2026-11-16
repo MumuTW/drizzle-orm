@@ -1,7 +1,7 @@
 import retry from 'async-retry';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres, { type Sql } from 'postgres';
+import postgres, { type ReservedSql, type Sql } from 'postgres';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
 
 import { Name, sql } from 'drizzle-orm';
@@ -63,6 +63,28 @@ beforeEach((ctx) => {
 		db: cachedDb,
 		dbGlobalCached,
 	};
+});
+
+test('executes queries on a caller-managed reserved connection', async () => {
+	const reserved = await client.reserve();
+	try {
+		// Postgres.js v3 declares ReservedSql as a full Sql. Exercise the narrower v4 shape.
+		const reservedClient: Pick<ReservedSql, 'unsafe' | 'release'> & Pick<Sql, 'options'> = Object.assign(
+			reserved,
+			{ options: client.options },
+		);
+		const reservedDb = drizzle({ client: reservedClient });
+		const [expected] = await reserved`select pg_backend_pid() as pid`;
+		const [actual] = await reservedDb.execute(sql`select pg_backend_pid() as pid`);
+
+		expect(reservedDb.$client).toBe(reserved);
+		expect(actual).toEqual(expected);
+		await expect(reservedDb.transaction(async () => {})).rejects.toThrow(
+			'Manage transactions directly when using a reserved Postgres.js connection.',
+		);
+	} finally {
+		reserved.release();
+	}
 });
 
 test('migrator : default migration strategy', async () => {

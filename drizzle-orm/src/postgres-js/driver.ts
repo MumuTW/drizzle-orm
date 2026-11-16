@@ -19,11 +19,13 @@ export class PostgresJsDatabase<
 	static override readonly [entityKind]: string = 'PostgresJsDatabase';
 }
 
+type PostgresJsClient = Sql | (Pick<Sql, 'unsafe' | 'options'> & { release(): void });
+
 function construct<TSchema extends Record<string, unknown> = Record<string, never>>(
-	client: Sql,
+	client: PostgresJsClient,
 	config: DrizzleConfig<TSchema> = {},
 ): PostgresJsDatabase<TSchema> & {
-	$client: Sql;
+	$client: PostgresJsClient;
 } {
 	const transparentParser = (val: any) => val;
 
@@ -69,7 +71,7 @@ function construct<TSchema extends Record<string, unknown> = Record<string, neve
 
 export function drizzle<
 	TSchema extends Record<string, unknown> = Record<string, never>,
-	TClient extends Sql = Sql,
+	TClient extends PostgresJsClient = Sql,
 >(
 	...params: [
 		TClient | string,
